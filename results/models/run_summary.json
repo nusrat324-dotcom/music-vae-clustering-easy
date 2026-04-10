@@ -1,0 +1,42 @@
+{
+    "feature_file_used": "C:\\Users\\mshakur\\OneDrive - Oklahoma A and M System\\Deep learning\\NNN\\modelling\\Data\\features_3_sec.csv",
+    "device_used": "cuda",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 5060",
+    "final_model_config": {
+        "latent_dim": 10,
+        "hidden_dims": [
+            128,
+            64
+        ],
+        "beta_max": 0.01,
+        "learning_rate": 0.0005,
+        "epochs": 10,
+        "warmup_epochs": 3,
+        "use_batchnorm": false,
+        "denoise_std": 0.0
+    },
+    "final_metrics": {
+        "vae_kmeans": {
+            "silhouette": 0.17474119365215302,
+            "calinski_harabasz": 1717.9498291015625,
+            "ari": 0.16726858096001068,
+            "nmi": 0.287929688788367,
+            "n_clusters_found": 10
+        },
+        "raw_gmm": {
+            "silhouette": 0.037263937294483185,
+            "calinski_harabasz": 612.3423461914062,
+            "ari": 0.19926473579647488,
+            "nmi": 0.31330309563601955,
+            "n_clusters_found": 10
+        },
+        "pca_kmeans": {
+            "silhouette": 0.15821214020252228,
+            "calinski_harabasz": 1460.594482421875,
+            "ari": 0.16238808830782742,
+            "nmi": 0.2844572209324169,
+            "n_clusters_found": 10
+        }
+    }
+}
