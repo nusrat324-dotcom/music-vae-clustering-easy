@@ -1,0 +1,673 @@
+import os
+import json
+import random
+import warnings
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    silhouette_score,
+    adjusted_rand_score,
+    normalized_mutual_info_score,
+    confusion_matrix
+)
+from sklearn.manifold import TSNE
+
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✅ Using device: {device}")
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+SPOTIFY_CSV = r"C:\Users\mshakur\Downloads\Modelling\deep_learning\kaggle\spotify_songs.csv"
+
+BASE_OUTPUT_DIR = r"C:\Users\mshakur\OneDrive - Oklahoma A and M System\Deep learning\NNN\modelling\outputs\hard"
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, f"final_betacvae_kmeans_{timestamp}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+BATCH_SIZE = 128
+EPOCHS = 40
+LEARNING_RATE = 1e-3
+
+TEXT_MAX_FEATURES = 5000
+TEXT_SVD_DIM = 128
+
+LATENT_DIM = 16
+BETA = 0.005
+USE_CVAE = True
+
+np.random.seed(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_STATE)
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def save_json(obj, path):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=4)
+
+
+def cluster_purity(y_true, y_pred):
+    table = pd.crosstab(pd.Series(y_pred), pd.Series(y_true))
+    return float(table.max(axis=1).sum() / table.to_numpy().sum())
+
+
+def compute_metrics(X, pred, true):
+    if len(np.unique(pred)) > 1:
+        sil = float(silhouette_score(X, pred))
+    else:
+        sil = np.nan
+
+    return {
+        "silhouette": sil,
+        "ari": float(adjusted_rand_score(true, pred)),
+        "nmi": float(normalized_mutual_info_score(true, pred)),
+        "purity": float(cluster_purity(true, pred)),
+        "n_clusters_found": int(len(np.unique(pred)))
+    }
+
+
+def plot_training_curves(history_df, save_path):
+    plt.figure(figsize=(10, 6))
+    plt.plot(history_df["epoch"], history_df["total_loss"], label="Total loss")
+    plt.plot(history_df["epoch"], history_df["audio_loss"], label="Audio reconstruction loss")
+    plt.plot(history_df["epoch"], history_df["text_loss"], label="Lyrics reconstruction loss")
+    plt.plot(history_df["epoch"], history_df["kl_loss"], label="KL loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Beta-CVAE Training Curves")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_validation_curve(history_df, save_path):
+    plt.figure(figsize=(8, 5))
+    plt.plot(history_df["epoch"], history_df["validation_score"], label="Validation clustering score")
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.title("Validation Clustering Score Across Epochs")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_embedding_with_legend(Z2, labels, label_names, title, save_path):
+    plt.figure(figsize=(9, 7))
+
+    unique_labels = np.unique(labels)
+    cmap = plt.get_cmap("tab10" if len(unique_labels) <= 10 else "tab20")
+
+    for i, lab in enumerate(unique_labels):
+        idx = labels == lab
+        plt.scatter(
+            Z2[idx, 0],
+            Z2[idx, 1],
+            s=14,
+            alpha=0.75,
+            color=cmap(i % cmap.N),
+            label=str(label_names[lab])
+        )
+
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.title(title)
+    plt.legend(
+        title="Class",
+        bbox_to_anchor=(1.05, 1),
+        loc="upper left",
+        fontsize=8
+    )
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_cluster_embedding_with_legend(Z2, cluster_labels, title, save_path):
+    plt.figure(figsize=(9, 7))
+
+    unique_clusters = np.unique(cluster_labels)
+    cmap = plt.get_cmap("tab10" if len(unique_clusters) <= 10 else "tab20")
+
+    for i, cluster in enumerate(unique_clusters):
+        idx = cluster_labels == cluster
+        plt.scatter(
+            Z2[idx, 0],
+            Z2[idx, 1],
+            s=14,
+            alpha=0.75,
+            color=cmap(i % cmap.N),
+            label=f"Cluster {cluster}"
+        )
+
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.title(title)
+    plt.legend(
+        title="KMeans cluster",
+        bbox_to_anchor=(1.05, 1),
+        loc="upper left",
+        fontsize=8
+    )
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_cluster_size(cluster_labels, save_path):
+    counts = pd.Series(cluster_labels).value_counts().sort_index()
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(counts.index.astype(str), counts.values, label="Samples per cluster")
+    plt.xlabel("KMeans Cluster")
+    plt.ylabel("Number of Songs")
+    plt.title("KMeans Cluster Size Distribution")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_cluster_genre_heatmap(cluster_labels, genre_labels, save_path):
+    table = pd.crosstab(
+        pd.Series(cluster_labels, name="KMeans Cluster"),
+        pd.Series(genre_labels, name="Genre")
+    )
+
+    plt.figure(figsize=(9, 6))
+    im = plt.imshow(table.values, aspect="auto")
+
+    plt.xticks(np.arange(table.shape[1]), table.columns, rotation=45, ha="right")
+    plt.yticks(np.arange(table.shape[0]), table.index)
+
+    plt.xlabel("Genre")
+    plt.ylabel("KMeans Cluster")
+    plt.title("KMeans Cluster Distribution Across Genres")
+    cbar = plt.colorbar(im)
+    cbar.set_label("Number of Songs")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    table.to_csv(save_path.replace(".png", ".csv"))
+
+
+def plot_metric_bar(metrics_dict, save_path):
+    metric_names = ["silhouette", "ari", "nmi", "purity"]
+    values = [metrics_dict[m] for m in metric_names]
+
+    plt.figure(figsize=(7, 5))
+    plt.bar([m.upper() for m in metric_names], values, label="Beta-CVAE + KMeans")
+    plt.ylabel("Metric Value")
+    plt.title("Final Beta-CVAE + KMeans Clustering Metrics")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_audio_reconstruction(original, reconstructed, audio_cols, save_path):
+    plt.figure(figsize=(12, 6))
+
+    for i in range(min(4, original.shape[0])):
+        plt.plot(
+            np.arange(len(audio_cols)),
+            original[i],
+            marker="o",
+            alpha=0.65,
+            label=f"Original sample {i+1}"
+        )
+        plt.plot(
+            np.arange(len(audio_cols)),
+            reconstructed[i],
+            marker="x",
+            linestyle="--",
+            alpha=0.85,
+            label=f"Reconstructed sample {i+1}"
+        )
+
+    plt.xticks(np.arange(len(audio_cols)), audio_cols, rotation=45, ha="right")
+    plt.xlabel("Spotify Audio Feature")
+    plt.ylabel("Standardized Value")
+    plt.title("Audio Feature Reconstruction Examples")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_confusion_heatmap(y_true, cluster_labels, class_names, save_path):
+    cm = confusion_matrix(y_true, cluster_labels)
+
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(cm, aspect="auto")
+
+    plt.xticks(np.arange(len(class_names)), [f"Cluster {i}" for i in range(len(class_names))], rotation=45, ha="right")
+    plt.yticks(np.arange(len(class_names)), class_names)
+
+    plt.xlabel("KMeans Cluster")
+    plt.ylabel("True Genre")
+    plt.title("Genre vs KMeans Cluster Matrix")
+    cbar = plt.colorbar(im)
+    cbar.set_label("Number of Songs")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+print("\nLoading Spotify dataset...")
+df = pd.read_csv(SPOTIFY_CSV)
+df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")]
+
+print("Original shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+required_columns = ["lyrics", "playlist_genre"]
+for col in required_columns:
+    if col not in df.columns:
+        raise ValueError(f"Required column missing: {col}")
+
+audio_candidates = [
+    "danceability",
+    "energy",
+    "key",
+    "loudness",
+    "mode",
+    "speechiness",
+    "acousticness",
+    "instrumentalness",
+    "liveness",
+    "valence",
+    "tempo",
+    "duration_ms"
+]
+
+audio_cols = [c for c in audio_candidates if c in df.columns]
+
+if len(audio_cols) == 0:
+    raise ValueError("No Spotify audio feature columns found.")
+
+df = df.dropna(subset=["lyrics", "playlist_genre"]).copy()
+df["lyrics"] = df["lyrics"].astype(str)
+df = df[df["lyrics"].str.len() > 20].copy()
+
+for c in audio_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=audio_cols).copy()
+df["playlist_genre"] = df["playlist_genre"].astype(str).str.strip()
+df = df.reset_index(drop=True)
+
+print("Cleaned shape:", df.shape)
+print("Genres:", sorted(df["playlist_genre"].unique().tolist()))
+
+
+# ============================================================
+# FEATURE PROCESSING
+# ============================================================
+
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(df["playlist_genre"].values)
+class_names = label_encoder.classes_
+num_classes = len(class_names)
+
+N_CLUSTERS = num_classes
+
+pd.DataFrame({
+    "encoded_label": np.arange(num_classes),
+    "genre": class_names
+}).to_csv(os.path.join(OUTPUT_DIR, "genre_label_mapping.csv"), index=False)
+
+audio_scaler = StandardScaler()
+X_audio = audio_scaler.fit_transform(df[audio_cols].values).astype(np.float32)
+
+print("\nBuilding lyrics TF-IDF + SVD features...")
+tfidf = TfidfVectorizer(
+    max_features=TEXT_MAX_FEATURES,
+    stop_words="english",
+    min_df=3,
+    max_df=0.90
+)
+
+X_tfidf = tfidf.fit_transform(tqdm(df["lyrics"].tolist(), desc="Vectorizing lyrics"))
+svd = TruncatedSVD(n_components=TEXT_SVD_DIM, random_state=RANDOM_STATE)
+X_text = svd.fit_transform(X_tfidf).astype(np.float32)
+
+X_fused = np.concatenate([X_audio, X_text], axis=1).astype(np.float32)
+
+print("Audio feature shape:", X_audio.shape)
+print("Text feature shape:", X_text.shape)
+print("Fused feature shape:", X_fused.shape)
+
+
+# ============================================================
+# SPLIT
+# ============================================================
+
+idx_all = np.arange(len(df))
+
+train_idx, val_idx = train_test_split(
+    idx_all,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+X_audio_train = X_audio[train_idx]
+X_audio_val = X_audio[val_idx]
+
+X_text_train = X_text[train_idx]
+X_text_val = X_text[val_idx]
+
+y_train = y[train_idx]
+y_val = y[val_idx]
+
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class SpotifyHybridDataset(Dataset):
+    def __init__(self, audio_x, text_x, labels):
+        self.audio_x = audio_x
+        self.text_x = text_x
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.audio_x)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.audio_x[idx], dtype=torch.float32),
+            torch.tensor(self.text_x[idx], dtype=torch.float32),
+            torch.tensor(self.labels[idx], dtype=torch.long)
+        )
+
+
+train_dataset = SpotifyHybridDataset(X_audio_train, X_text_train, y_train)
+val_dataset = SpotifyHybridDataset(X_audio_val, X_text_val, y_val)
+full_dataset = SpotifyHybridDataset(X_audio, X_text, y)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=torch.cuda.is_available())
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available())
+full_loader = DataLoader(full_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available())
+
+
+# ============================================================
+# BETA-CVAE MODEL
+# ============================================================
+
+class BetaCVAE(nn.Module):
+    def __init__(self, audio_dim, text_dim, num_classes, latent_dim=16, use_cvae=True):
+        super().__init__()
+
+        self.use_cvae = use_cvae
+        self.num_classes = num_classes
+        cond_dim = num_classes if use_cvae else 0
+
+        self.audio_encoder = nn.Sequential(
+            nn.Linear(audio_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.2)
+        )
+
+        self.text_encoder = nn.Sequential(
+            nn.Linear(text_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2)
+        )
+
+        fused_dim = 32 + 128 + cond_dim
+
+        self.mu_layer = nn.Linear(fused_dim, latent_dim)
+        self.logvar_layer = nn.Linear(fused_dim, latent_dim)
+
+        decoder_input_dim = latent_dim + cond_dim
+
+        self.audio_decoder = nn.Sequential(
+            nn.Linear(decoder_input_dim, 32),
+            nn.LeakyReLU(0.2),
+            nn.Linear(32, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, audio_dim)
+        )
+
+        self.text_decoder = nn.Sequential(
+            nn.Linear(decoder_input_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, text_dim)
+        )
+
+    def one_hot(self, labels):
+        return torch.nn.functional.one_hot(labels, num_classes=self.num_classes).float()
+
+    def encode(self, audio_x, text_x, labels):
+        a = self.audio_encoder(audio_x)
+        t = self.text_encoder(text_x)
+
+        if self.use_cvae:
+            c = self.one_hot(labels)
+            fused = torch.cat([a, t, c], dim=1)
+        else:
+            fused = torch.cat([a, t], dim=1)
+
+        mu = self.mu_layer(fused)
+        logvar = self.logvar_layer(fused)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, labels):
+        if self.use_cvae:
+            c = self.one_hot(labels)
+            z = torch.cat([z, c], dim=1)
+
+        recon_audio = self.audio_decoder(z)
+        recon_text = self.text_decoder(z)
+        return recon_audio, recon_text
+
+    def forward(self, audio_x, text_x, labels):
+        mu, logvar = self.encode(audio_x, text_x, labels)
+        z = self.reparameterize(mu, logvar)
+        recon_audio, recon_text = self.decode(z, labels)
+        return recon_audio, recon_text, mu, logvar
+
+
+def beta_cvae_loss(recon_audio, audio_x, recon_text, text_x, mu, logvar, beta):
+    audio_loss = nn.MSELoss(reduction="sum")(recon_audio, audio_x)
+    text_loss = nn.MSELoss(reduction="sum")(recon_text, text_x)
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    total = audio_loss + text_loss + beta * kl_loss
+    return total, audio_loss, text_loss, kl_loss
+
+
+# ============================================================
+# TRAIN MODEL
+# ============================================================
+
+model = BetaCVAE(
+    audio_dim=X_audio.shape[1],
+    text_dim=X_text.shape[1],
+    num_classes=num_classes,
+    latent_dim=LATENT_DIM,
+    use_cvae=USE_CVAE
+).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+
+history = []
+best_state = None
+best_epoch = -1
+best_score = -1e9
+
+print("\nTraining final Beta-CVAE model...")
+
+for epoch in range(EPOCHS):
+    model.train()
+
+    total_epoch = 0.0
+    audio_epoch = 0.0
+    text_epoch = 0.0
+    kl_epoch = 0.0
+
+    for audio_x, text_x, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
+        audio_x = audio_x.to(device, non_blocking=True)
+        text_x = text_x.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        recon_audio, recon_text, mu, logvar = model(audio_x, text_x, labels)
+        loss, audio_loss, text_loss, kl_loss = beta_cvae_loss(
+            recon_audio, audio_x, recon_text, text_x, mu, logvar, beta=BETA
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        total_epoch += loss.item()
+        audio_epoch += audio_loss.item()
+        text_epoch += text_loss.item()
+        kl_epoch += kl_loss.item()
+
+    avg_total = total_epoch / len(train_loader.dataset)
+    avg_audio = audio_epoch / len(train_loader.dataset)
+    avg_text = text_epoch / len(train_loader.dataset)
+    avg_kl = kl_epoch / len(train_loader.dataset)
+
+    model.eval()
+    z_val = []
+    y_val_list = []
+
+    with torch.no_grad():
+        for audio_x, text_x, labels in val_loader:
+            audio_x = audio_x.to(device, non_blocking=True)
+            text_x = text_x.to(device, non_blocking=True)
+            labels_gpu = labels.to(device, non_blocking=True)
+
+            mu, logvar = model.encode(audio_x, text_x, labels_gpu)
+            z_val.append(mu.cpu().numpy())
+            y_val_list.append(labels.numpy())
+
+    Z_val = np.vstack(z_val)
+    y_val_now = np.concatenate(y_val_list)
+
+    km_val = KMeans(n_clusters=N_CLUSTERS, random_state=RANDOM_STATE, n_init=20)
+    val_pred = km_val.fit_predict(Z_val)
+    val_metrics = compute_metrics(Z_val, val_pred, y_val_now)
+
+    score = (
+        0.30 * (val_metrics["silhouette"] if not np.isnan(val_metrics["silhouette"]) else -1.0)
+        + 0.20 * val_metrics["ari"]
+        + 0.25 * val_metrics["nmi"]
+        + 0.25 * val_metrics["purity"]
+    )
+
+    history.append({
+        "epoch": epoch + 1,
+        "total_loss": avg_total,
+        "audio_loss": avg_audio,
+        "text_loss": avg_text,
+        "kl_loss": avg_kl,
+        "validation_score": score,
+        **val_metrics
+    })
+
+    print(
+        f"Epoch [{epoch+1}/{EPOCHS}] "
+        f"Total={avg_total:.4f} | Audio={avg_audio:.4f} | Text={avg_text:.4f} | "
+        f"KL={avg_kl:.4f} | ValScore={score:.4f}"
+    )
+
+    if score > best_score:
+        best_score = score
+        best_epoch = epoch + 1
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+model.load_state_dict(best_state)
+torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_beta_cvae_kmeans_model.pth"))
+
+history_df = pd.DataFrame(history)
+history_df.to_csv(os.path.join(OUTPUT_DIR, "training_history.csv"), index=False)
+
+
+# ============================================================
+# EXTRACT LATENT FEATURES
+# ============================================================
+
+model.eval()
+
+z_all = []
+y_all = []
+recon_audio_list = []
+orig_audio_list = []
+
+with torch.no_grad():
+    for audio_x, text_x, labels in tqdm(full_loader, desc="Extracting latent features", leave=False):
+        audio_x

@@ -1,0 +1,2 @@
+Method,silhouette,ari,nmi,purity,n_clusters_found
+Beta-CVAE Fused Latent + KMeans,0.18507549166679382,0.06310693592245618,0.1126399635202246,0.36203759854457246,6
