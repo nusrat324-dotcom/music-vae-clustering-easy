@@ -1,0 +1,23 @@
+{
+    "dataset_path": "C:\\Users\\mshakur\\Downloads\\Modelling\\deep_learning\\millionsongsubset",
+    "device_used": "cuda",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 5060",
+    "final_model_config": {
+        "text_dim": 50,
+        "latent_dim": 8,
+        "beta_max": 0.005,
+        "best_epoch": 1,
+        "epochs_run": 300,
+        "audio_loss_weight": 1.0,
+        "text_loss_weight": 0.3
+    },
+    "final_vae_metrics": {
+        "n_clusters_found": 10,
+        "silhouette": 0.2796758711338043,
+        "davies_bouldin": 0.9999971204366535,
+        "ari": 0.0006459453883674286,
+        "nmi": 0.3913312015263245
+    },
+    "note": "ARI and NMI use artist-based weak labels and should be interpreted cautiously."
+}
